@@ -275,7 +275,7 @@ def progress_payload() -> dict[str, object]:
     phase_detail = "No active pipeline process"
     phase_progress = 0.0
     phase_eta = "Unknown"
-    overall_progress = 0
+    overall_progress = 0.0
     stage = "IDLE VOID"
 
     # Overall weighting by phase
@@ -369,9 +369,9 @@ def progress_payload() -> dict[str, object]:
 
         if phase in phase_weights:
             lo, hi = phase_weights[phase]
-            overall_progress = int(lo + (hi - lo) * clamp01(phase_progress))
+            overall_progress = lo + (hi - lo) * clamp01(phase_progress)
         else:
-            overall_progress = max(2, int(20 * clamp01(phase_progress)))
+            overall_progress = max(2.0, 20.0 * clamp01(phase_progress))
 
         phase_eta = phase_eta if phase_eta != "Unknown" else "estimating"
     elif "Full pipeline exit status: 0" in orch_text:
@@ -380,21 +380,21 @@ def progress_payload() -> dict[str, object]:
         phase_detail = "Pipeline finished successfully"
         phase_progress = 1.0
         phase_eta = "Done"
-        overall_progress = 100
+        overall_progress = 100.0
     elif failed:
         stage = "RUN FAILED"
         phase = "Failed"
         phase_detail = "Write timeout in latest run; inspect full log tail"
         phase_progress = 0.0
         phase_eta = "Stopped"
-        overall_progress = 0
+        overall_progress = 0.0
     elif orch_pid:
         stage = "BOOTSTRAPPING"
         phase = "Init"
         phase_detail = "Orchestrator alive; waiting on worker process"
         phase_progress = 0.1
         phase_eta = "Preparing"
-        overall_progress = 1
+        overall_progress = 1.0
 
     tiers = tier_counts(ANNOTATED_TSV)
     couple_candidates = candidate_count(CANDIDATE_TSV)
@@ -404,9 +404,9 @@ def progress_payload() -> dict[str, object]:
         "stage": stage,
         "detail": f"{phase}: {phase_detail}",
         "eta": phase_eta,
-        "progress": overall_progress,
+        "progress": round(clamp01(overall_progress / 100.0) * 100.0, 2),
         "phase": phase,
-        "phase_progress": int(100 * clamp01(phase_progress)),
+        "phase_progress": round(100.0 * clamp01(phase_progress), 2),
         "phase_detail": phase_detail,
         "orch_pid": orch_pid or "none",
         "bwa_pid": bwa_index_pid or "none",
@@ -488,7 +488,7 @@ def html_page() -> str:
       overscroll-behavior-y: none;
       -webkit-overflow-scrolling: touch;
       overflow-x: hidden;
-      overflow-y: hidden;
+      overflow-y: auto;
       font-family: \"Arial Black\", \"Impact\", \"Avenir Next\", sans-serif;
       color: var(--ink);
       background:
@@ -516,10 +516,7 @@ def html_page() -> str:
       margin: 0 auto;
       display: grid;
       gap: 12px;
-      height: 100vh;
-      overflow-y: auto;
-      overscroll-behavior-y: contain;
-      -webkit-overflow-scrolling: touch;
+      min-height: 100vh;
       padding: 14px;
     }
     .hero {
@@ -713,14 +710,19 @@ def html_page() -> str:
     const byId = (id) => document.getElementById(id);
     const setText = (id, value) => byId(id).textContent = value;
     const controlButtons = ["btnStart", "btnStop", "btnRestart"];
+    const asNum = (value) => {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : 0;
+    };
+    const fmtPct = (value) => `${asNum(value).toFixed(2)}%`;
 
     function render(data) {
       setText("stage", data.stage || "Unknown");
       setText("detail", data.detail || "No detail");
       setText("eta", `ETA ${data.eta || "Unknown"}`);
-      setText("progress", `${data.progress || 0}%`);
+      setText("progress", fmtPct(data.progress));
       setText("phase", data.phase || "Unknown");
-      setText("phaseProgress", `${data.phase_progress || 0}%`);
+      setText("phaseProgress", fmtPct(data.phase_progress));
       setText("phaseDetail", data.phase_detail || "--");
       setText("orch", data.orch_pid || "none");
       setText("bwa", data.bwa_pid || "none");
@@ -729,8 +731,8 @@ def html_page() -> str:
       setText("now", data.now || "--");
       setText("idxscore", String(data.idx_score || 0));
 
-      byId("fill").style.width = `${data.progress || 0}%`;
-      byId("phaseFill").style.width = `${data.phase_progress || 0}%`;
+      byId("fill").style.width = `${asNum(data.progress)}%`;
+      byId("phaseFill").style.width = `${asNum(data.phase_progress)}%`;
 
       const idx = data.idx || {};
       byId("idxrows").innerHTML = [".amb", ".ann", ".bwt", ".pac", ".sa"]
