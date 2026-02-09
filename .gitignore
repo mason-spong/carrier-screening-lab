@@ -1,0 +1,46 @@
+# OS/editor
+.DS_Store
+*.swp
+
+# Python/env/tooling
+.venv/
+.env
+*.log
+__pycache__/
+*.pyc
+
+# Raw and heavy genomics data
+/data/raw/**
+/data/interim/**
+/data/processed/**
+/data/refs/**
+/results/**
+/reports/**
+/logs/**
+
+# Keep structure placeholders
+!/data/raw/.gitkeep
+!/data/raw/mason/.gitkeep
+!/data/raw/hannah/.gitkeep
+!/data/interim/.gitkeep
+!/data/processed/.gitkeep
+!/data/refs/.gitkeep
+!/results/.gitkeep
+!/reports/.gitkeep
+!/logs/.gitkeep
+
+# Common bioinformatics outputs
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+*.bam
+*.bai
+*.cram
+*.crai
+*.vcf
+*.vcf.gz
+*.tbi
+*.g.vcf
+*.g.vcf.gz
+*.sam
