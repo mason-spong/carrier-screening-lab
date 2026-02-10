@@ -7,6 +7,7 @@ cd "$ROOT_DIR"
 THREADS="${THREADS:-8}"
 RUN_TS_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 RUN_TS_LOCAL="$(date +"%Y-%m-%d %H:%M:%S %Z")"
+RUN_ID="${RUN_TS_UTC//[^0-9A-Za-z]/}"
 LOG_FILE="logs/mason_full_run.log"
 
 mkdir -p logs reports results \
@@ -29,6 +30,45 @@ ANNO_DIR="data/interim/mason/annotation"
 PROC_DIR="data/processed/mason"
 REF_DIR="data/refs/grch38"
 CLINVAR_DIR="data/refs/clinvar"
+FULL_RUN_LOCK_DIR="$STATE_DIR/full_run.lock"
+SORT_TMP_BASE="${SORT_TMP_BASE:-$ALIGN_DIR/sort_tmp}"
+SORT_TMP_DIR=""
+PHASE3_MIN_FREE_GIB="${PHASE3_MIN_FREE_GIB:-450}"
+SAMTOOLS_SORT_MEM_PER_THREAD="${SAMTOOLS_SORT_MEM_PER_THREAD:-1G}"
+
+release_runtime_state() {
+  if [[ -n "${SORT_TMP_DIR:-}" ]]; then
+    rm -rf "$SORT_TMP_DIR"
+  fi
+  rm -rf "$FULL_RUN_LOCK_DIR"
+}
+
+acquire_runtime_lock() {
+  if mkdir "$FULL_RUN_LOCK_DIR" 2>/dev/null; then
+    echo "$$" > "$FULL_RUN_LOCK_DIR/pid"
+    return
+  fi
+
+  local existing_pid=""
+  if [[ -f "$FULL_RUN_LOCK_DIR/pid" ]]; then
+    existing_pid="$(cat "$FULL_RUN_LOCK_DIR/pid" 2>/dev/null || true)"
+  fi
+
+  if [[ -n "$existing_pid" ]] && ps -p "$existing_pid" >/dev/null 2>&1; then
+    echo "ERROR: full Mason analysis already running (pid: $existing_pid)" >&2
+    exit 1
+  fi
+
+  rm -rf "$FULL_RUN_LOCK_DIR"
+  if ! mkdir "$FULL_RUN_LOCK_DIR" 2>/dev/null; then
+    echo "ERROR: unable to acquire full-run lock: $FULL_RUN_LOCK_DIR" >&2
+    exit 1
+  fi
+  echo "$$" > "$FULL_RUN_LOCK_DIR/pid"
+}
+
+trap release_runtime_state EXIT INT TERM
+acquire_runtime_lock
 
 MASON_R1="$(awk -F '\t' '$1=="mason" {print $3}' config/samples.tsv)"
 MASON_R2="$(awk -F '\t' '$1=="mason" {print $4}' config/samples.tsv)"
@@ -53,6 +93,35 @@ is_done() {
 
 mark_done() {
   touch "$STATE_DIR/$1.done"
+}
+
+available_gib() {
+  local path="$1"
+  df -kP "$path" | awk 'NR==2 {printf "%.2f", $4/1048576}'
+}
+
+require_min_free_gib() {
+  local path="$1"
+  local min_gib="$2"
+  local avail_kib
+  local avail_gib
+
+  avail_kib="$(df -kP "$path" | awk 'NR==2 {print $4}')"
+  if [[ -z "$avail_kib" ]]; then
+    echo "ERROR: unable to inspect free space for $path" >&2
+    exit 1
+  fi
+  avail_gib="$(awk -v k="$avail_kib" 'BEGIN {printf "%.2f", k/1048576}')"
+
+  if [[ "$(awk -v avail="$avail_kib" -v min="$min_gib" 'BEGIN {print (avail >= (min * 1048576)) ? 1 : 0}')" != "1" ]]; then
+    echo "ERROR: insufficient free space at $path (available ${avail_gib} GiB, required ${min_gib} GiB)" >&2
+    exit 1
+  fi
+}
+
+filesystem_for_path() {
+  local path="$1"
+  df -P "$path" | awk 'NR==2 {print $1}'
 }
 
 get_fastqc_dir() {
@@ -144,23 +213,46 @@ fi
 BAM="$ALIGN_DIR/mason.markdup.bam"
 if ! is_done phase3_align; then
   echo "[$(date +"%Y-%m-%d %H:%M:%S")] Phase 3: Alignment and post-processing"
+  mkdir -p "$SORT_TMP_BASE"
+
+  echo "[$(date +"%Y-%m-%d %H:%M:%S")] Phase 3 preflight: free space at $ALIGN_DIR = $(available_gib "$ALIGN_DIR") GiB (required >= ${PHASE3_MIN_FREE_GIB} GiB)"
+  require_min_free_gib "$ALIGN_DIR" "$PHASE3_MIN_FREE_GIB"
+
+  if [[ "$(filesystem_for_path "$SORT_TMP_BASE")" != "$(filesystem_for_path "$ALIGN_DIR")" ]]; then
+    echo "[$(date +"%Y-%m-%d %H:%M:%S")] Phase 3 preflight: free space at $SORT_TMP_BASE = $(available_gib "$SORT_TMP_BASE") GiB (required >= ${PHASE3_MIN_FREE_GIB} GiB)"
+    require_min_free_gib "$SORT_TMP_BASE" "$PHASE3_MIN_FREE_GIB"
+  fi
+
+  SORT_TMP_DIR="$SORT_TMP_BASE/run_${RUN_ID}_$$"
+  mkdir -p "$SORT_TMP_DIR"
+  find "$ALIGN_DIR" -maxdepth 1 -type f -name 'mason.*.tmp.*.bam' -delete
 
   bwa mem -t "$THREADS" \
     -R '@RG\tID:mason\tSM:mason\tPL:ILLUMINA\tLB:mason_lib\tPU:l001' \
     "$REF_FA" "$MASON_R1" "$MASON_R2" \
-    | samtools view -@ "$THREADS" -b -o "$ALIGN_DIR/mason.raw.bam" -
+    | samtools view -@ "$THREADS" -u - \
+    | samtools sort -n -@ "$THREADS" -m "$SAMTOOLS_SORT_MEM_PER_THREAD" \
+      -T "$SORT_TMP_DIR/mason.name" \
+      -o "$ALIGN_DIR/mason.name.bam" -
 
-  samtools sort -n -@ "$THREADS" -o "$ALIGN_DIR/mason.name.bam" "$ALIGN_DIR/mason.raw.bam"
   samtools fixmate -m -@ "$THREADS" "$ALIGN_DIR/mason.name.bam" "$ALIGN_DIR/mason.fixmate.bam"
-  samtools sort -@ "$THREADS" -o "$ALIGN_DIR/mason.pos.bam" "$ALIGN_DIR/mason.fixmate.bam"
+  rm -f "$ALIGN_DIR/mason.name.bam"
+
+  samtools sort -@ "$THREADS" -m "$SAMTOOLS_SORT_MEM_PER_THREAD" \
+    -T "$SORT_TMP_DIR/mason.pos" \
+    -o "$ALIGN_DIR/mason.pos.bam" "$ALIGN_DIR/mason.fixmate.bam"
+  rm -f "$ALIGN_DIR/mason.fixmate.bam"
+
   samtools markdup -@ "$THREADS" -s "$ALIGN_DIR/mason.pos.bam" "$BAM" 2> "$ALIGN_DIR/mason.markdup.stats.txt"
+  rm -f "$ALIGN_DIR/mason.pos.bam"
   samtools index -@ "$THREADS" "$BAM"
 
   samtools flagstat -@ "$THREADS" "$BAM" > "$ALIGN_DIR/mason.flagstat.txt"
   samtools stats -@ "$THREADS" "$BAM" > "$ALIGN_DIR/mason.stats.txt"
   samtools coverage "$BAM" > "$ALIGN_DIR/mason.coverage.tsv"
 
-  rm -f "$ALIGN_DIR/mason.raw.bam" "$ALIGN_DIR/mason.name.bam" "$ALIGN_DIR/mason.fixmate.bam" "$ALIGN_DIR/mason.pos.bam"
+  rm -rf "$SORT_TMP_DIR"
+  SORT_TMP_DIR=""
 
   mark_done phase3_align
 fi

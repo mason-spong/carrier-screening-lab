@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+from collections import deque
 import datetime as dt
 import json
 import os
 import re
 import subprocess
 import sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -19,16 +22,64 @@ CANDIDATE_TSV = ROOT / "results" / "carrier_candidates_couple.tsv"
 SAMPLES_TSV = ROOT / "config" / "samples.tsv"
 STATE_DIR = ROOT / "data" / "interim" / "mason" / "state"
 ALIGN_DIR = ROOT / "data" / "interim" / "mason" / "alignment"
+VAR_DIR = ROOT / "data" / "interim" / "mason" / "variants"
+ANNO_DIR = ROOT / "data" / "interim" / "mason" / "annotation"
+PROC_DIR = ROOT / "data" / "processed" / "mason"
 REF_FA = ROOT / "data" / "refs" / "grch38" / "Homo_sapiens.GRCh38.dna.primary_assembly.fa"
 START_SCRIPT = ROOT / "scripts" / "start_mason_local.sh"
 STOP_SCRIPT = ROOT / "scripts" / "stop_mason_local.sh"
 PORT = int(os.environ.get("STATUS_UI_MAX_PORT", "8788"))
+HISTORY_MAX = int(os.environ.get("STATUS_UI_MAX_HISTORY_POINTS", "240"))
+STATUS_CACHE_TTL_SEC = float(os.environ.get("STATUS_UI_MAX_CACHE_TTL_SEC", "1.2"))
+
+FLUX_FILES = [
+    ALIGN_DIR / "mason.raw.bam",
+    ALIGN_DIR / "mason.name.bam",
+    ALIGN_DIR / "mason.fixmate.bam",
+    ALIGN_DIR / "mason.pos.bam",
+    ALIGN_DIR / "mason.markdup.bam",
+    VAR_DIR / "mason.filtered.vcf.gz",
+    ANNO_DIR / "mason.snpeff.vcf.gz",
+    PROC_DIR / "mason.annotated.clinvar.snpeff.vcf.gz",
+    FULL_LOG,
+]
 
 
-def run(cmd: str) -> str:
+def detect_logical_cpu() -> int:
     try:
-        out = subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.DEVNULL)
+        out = subprocess.check_output(
+            ["sysctl", "-n", "hw.logicalcpu"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        out = ""
+    try:
+        cpu = int(out.strip())
+        return cpu if cpu > 0 else 1
+    except Exception:
+        return max(1, os.cpu_count() or 1)
+
+
+LOGICAL_CPU = detect_logical_cpu()
+TELEMETRY_HISTORY: deque[dict[str, float | int]] = deque(maxlen=max(30, HISTORY_MAX))
+TELEMETRY_LAST: dict[str, float] = {"ts": 0.0, "bytes": 0.0, "flux_ema": 0.0}
+STATUS_CACHE_LOCK = threading.Lock()
+STATUS_CACHE: dict[str, object] = {"ts": 0.0, "payload": None}
+
+
+def run(cmd: str, timeout_sec: float = 2.5) -> str:
+    try:
+        out = subprocess.check_output(
+            cmd,
+            shell=True,
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout_sec,
+        )
         return out.strip()
+    except subprocess.TimeoutExpired:
+        return ""
     except Exception:
         return ""
 
@@ -70,8 +121,40 @@ def read_tail(path: Path, n: int) -> str:
     if not path.exists():
         return ""
     try:
-        lines = path.read_text(errors="replace").splitlines()[-n:]
+        if n <= 0:
+            return ""
+        chunk = 8192
+        want = n + 1
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            pos = fh.tell()
+            data = b""
+            lines_found = 0
+            while pos > 0 and lines_found < want:
+                take = min(chunk, pos)
+                pos -= take
+                fh.seek(pos, os.SEEK_SET)
+                block = fh.read(take)
+                data = block + data
+                lines_found = data.count(b"\n")
+        text = data.decode("utf-8", errors="replace")
+        lines = text.splitlines()[-n:]
         return "\n".join(lines)
+    except Exception:
+        return ""
+
+
+def read_recent_text(path: Path, max_bytes: int) -> str:
+    if not path.exists() or max_bytes <= 0:
+        return ""
+    try:
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            take = min(size, max_bytes)
+            fh.seek(size - take, os.SEEK_SET)
+            data = fh.read(take)
+        return data.decode("utf-8", errors="replace")
     except Exception:
         return ""
 
@@ -128,6 +211,200 @@ def file_size(path: Path) -> int:
     except Exception:
         pass
     return 0
+
+
+def clamp100(v: float) -> float:
+    if v < 0:
+        return 0.0
+    if v > 100:
+        return 100.0
+    return v
+
+
+def parse_float(text: str) -> float | None:
+    try:
+        return float(text.strip())
+    except Exception:
+        return None
+
+
+def host_memory_pressure_pct() -> float:
+    free_txt = run(
+        "memory_pressure -Q | awk -F': ' '/System-wide memory free percentage/ "
+        "{gsub(/%/, \"\", $2); print $2; exit}'"
+    )
+    free_pct = parse_float(free_txt) if free_txt else None
+    if free_pct is not None:
+        return clamp100(100.0 - free_pct)
+
+    mem_sum = parse_float(run("ps -A -o %mem= | awk '{s+=$1} END{printf \"%.2f\\n\", s}'"))
+    return clamp100(mem_sum if mem_sum is not None else 0.0)
+
+
+def host_load_1m() -> float:
+    out = run("sysctl -n vm.loadavg")
+    m = re.search(r"{\s*([0-9.]+)", out)
+    if not m:
+        return 0.0
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return 0.0
+
+
+def read_process_rows() -> list[dict[str, object]]:
+    out = run("ps -Ao pid=,ppid=,%cpu=,%mem=,command=")
+    rows: list[dict[str, object]] = []
+    for line in out.splitlines():
+        m = re.match(r"\s*(\d+)\s+(\d+)\s+([0-9.]+)\s+([0-9.]+)\s+(.*)", line)
+        if not m:
+            continue
+        rows.append(
+            {
+                "pid": int(m.group(1)),
+                "ppid": int(m.group(2)),
+                "cpu": float(m.group(3)),
+                "mem": float(m.group(4)),
+                "cmd": m.group(5),
+            }
+        )
+    return rows
+
+
+def descendant_pid_set(root_pids: set[int], rows: list[dict[str, object]]) -> set[int]:
+    if not root_pids:
+        return set()
+    children: dict[int, list[int]] = {}
+    for row in rows:
+        pid = int(row["pid"])
+        ppid = int(row["ppid"])
+        children.setdefault(ppid, []).append(pid)
+
+    seen: set[int] = set()
+    stack = list(root_pids)
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        stack.extend(children.get(pid, []))
+    return seen
+
+
+def trim_cmd(cmd: str, n: int = 90) -> str:
+    if len(cmd) <= n:
+        return cmd
+    return cmd[: n - 3] + "..."
+
+
+def process_usage(rows: list[dict[str, object]], pipeline_pids: set[int]) -> dict[str, object]:
+    total_cpu_raw = sum(float(r["cpu"]) for r in rows)
+    host_cpu_pct = clamp100(total_cpu_raw / float(LOGICAL_CPU))
+
+    pipeline_rows = [r for r in rows if int(r["pid"]) in pipeline_pids]
+    pipeline_cpu_raw = sum(float(r["cpu"]) for r in pipeline_rows)
+    pipeline_mem_pct = clamp100(sum(float(r["mem"]) for r in pipeline_rows))
+    pipeline_cpu_pct = clamp100(pipeline_cpu_raw / float(LOGICAL_CPU))
+    pipeline_share_pct = clamp100((pipeline_cpu_raw / total_cpu_raw) * 100.0) if total_cpu_raw > 0 else 0.0
+
+    top_workers = sorted(pipeline_rows, key=lambda r: float(r["cpu"]), reverse=True)[:4]
+    top_list = [
+        {
+            "pid": int(row["pid"]),
+            "cpu_pct": round(clamp100(float(row["cpu"]) / float(LOGICAL_CPU)), 2),
+            "cmd": trim_cmd(str(row["cmd"])),
+        }
+        for row in top_workers
+    ]
+
+    return {
+        "host_cpu_pct": round(host_cpu_pct, 2),
+        "pipeline_cpu_pct": round(pipeline_cpu_pct, 2),
+        "pipeline_mem_pct": round(pipeline_mem_pct, 2),
+        "pipeline_share_pct": round(pipeline_share_pct, 2),
+        "pipeline_pid_count": len(pipeline_rows),
+        "top_workers": top_list,
+    }
+
+
+def sample_data_flux() -> tuple[float, float]:
+    now_ts = time.time()
+    total_bytes = float(sum(file_size(path) for path in FLUX_FILES))
+    prev_ts = TELEMETRY_LAST.get("ts", 0.0)
+    prev_bytes = TELEMETRY_LAST.get("bytes", 0.0)
+    prev_ema = TELEMETRY_LAST.get("flux_ema", 0.0)
+
+    TELEMETRY_LAST["ts"] = now_ts
+    TELEMETRY_LAST["bytes"] = total_bytes
+
+    if prev_ts <= 0.0 or now_ts <= prev_ts:
+        TELEMETRY_LAST["flux_ema"] = 0.0
+        return 0.0, 0.0
+
+    delta = max(0.0, total_bytes - prev_bytes)
+    raw_mbps = delta / max(0.001, now_ts - prev_ts) / 1_000_000.0
+    ema_mbps = raw_mbps if prev_ema <= 0 else (0.35 * raw_mbps + 0.65 * prev_ema)
+    TELEMETRY_LAST["flux_ema"] = ema_mbps
+    return raw_mbps, ema_mbps
+
+
+def telemetry_payload(root_pid_text: list[str], has_active_run: bool) -> dict[str, object]:
+    root_pids: set[int] = set()
+    for text in root_pid_text:
+        t = (text or "").strip()
+        if t.isdigit():
+            root_pids.add(int(t))
+
+    rows = read_process_rows()
+    pipeline_pids = descendant_pid_set(root_pids, rows)
+    usage = process_usage(rows, pipeline_pids)
+
+    mem_pressure = round(host_memory_pressure_pct(), 2)
+    load_1m = round(host_load_1m(), 2)
+    _, flux_mbps = sample_data_flux()
+    flux_mbps = round(flux_mbps, 2)
+    flux_norm = clamp100((flux_mbps / 30.0) * 100.0)
+
+    load_focus = usage["pipeline_cpu_pct"] if usage["pipeline_pid_count"] > 0 else usage["host_cpu_pct"]
+    if has_active_run and usage["pipeline_pid_count"] == 0:
+        load_focus = 0.7 * usage["host_cpu_pct"]
+
+    load_index = clamp100(
+        (0.48 * float(load_focus))
+        + (0.18 * float(usage["host_cpu_pct"]))
+        + (0.16 * mem_pressure)
+        + (0.18 * flux_norm)
+    )
+
+    scope = "pipeline" if usage["pipeline_pid_count"] > 0 else ("host-fallback" if has_active_run else "host")
+    confidence = 0.95 if scope == "pipeline" else (0.6 if scope == "host-fallback" else 0.8)
+
+    point = {
+        "t": int(time.time() * 1000),
+        "host_cpu": float(usage["host_cpu_pct"]),
+        "pipe_cpu": float(usage["pipeline_cpu_pct"]),
+        "pipe_share": float(usage["pipeline_share_pct"]),
+        "mem": mem_pressure,
+        "flux": flux_mbps,
+        "load_index": round(load_index, 2),
+    }
+    TELEMETRY_HISTORY.append(point)
+
+    return {
+        "logical_cpu": LOGICAL_CPU,
+        "scope": scope,
+        "confidence": confidence,
+        "host_cpu_pct": usage["host_cpu_pct"],
+        "pipeline_cpu_pct": usage["pipeline_cpu_pct"],
+        "pipeline_mem_pct": usage["pipeline_mem_pct"],
+        "pipeline_share_pct": usage["pipeline_share_pct"],
+        "memory_pressure_pct": mem_pressure,
+        "load_1m": load_1m,
+        "data_flux_mbps": flux_mbps,
+        "load_index": round(load_index, 2),
+        "top_workers": usage["top_workers"],
+        "history": list(TELEMETRY_HISTORY),
+    }
 
 
 def state_done(name: str) -> bool:
@@ -249,8 +526,8 @@ def progress_payload() -> dict[str, object]:
     bcftools_pid = pid_of("bcftools")
     snpeff_pid = pid_of_any(["snpEff", "java .*snpEff"])
 
-    orch_text = ORCH_LOG.read_text(errors="replace") if ORCH_LOG.exists() else ""
-    full_text = FULL_LOG.read_text(errors="replace") if FULL_LOG.exists() else ""
+    orch_text = read_recent_text(ORCH_LOG, 1_000_000)
+    full_text = read_recent_text(FULL_LOG, 1_000_000)
     full_tail = read_tail(FULL_LOG, 40)
 
     failed = ("Operation timed out" in full_tail) or ("ERROR:" in full_tail and not full_pid)
@@ -276,7 +553,7 @@ def progress_payload() -> dict[str, object]:
     phase_progress = 0.0
     phase_eta = "Unknown"
     overall_progress = 0.0
-    stage = "IDLE VOID"
+    stage = "IDLE"
 
     # Overall weighting by phase
     phase_weights = {
@@ -290,7 +567,7 @@ def progress_payload() -> dict[str, object]:
     }
 
     if bwa_index_pid:
-        stage = "INDEX RAGE"
+        stage = "INDEXING"
         phase = "Phase 2"
         phase_detail = "Building GRCh38 BWA index"
         iter_match = re.findall(r"BWTIncConstructFromPacked\]\s+(\d+)\s+iterations done", orch_text[-400000:])
@@ -305,7 +582,7 @@ def progress_payload() -> dict[str, object]:
             phase_progress = 0.02
             phase_eta = "estimating"
     elif full_pid:
-        stage = "PIPELINE OVERDRIVE"
+        stage = "PIPELINE RUNNING"
         last_phase = last_phase_name(full_text)
         if last_phase.startswith("Phase 1"):
             phase = "Phase 1"
@@ -375,7 +652,7 @@ def progress_payload() -> dict[str, object]:
 
         phase_eta = phase_eta if phase_eta != "Unknown" else "estimating"
     elif "Full pipeline exit status: 0" in orch_text:
-        stage = "RUN LANDED"
+        stage = "RUN COMPLETE"
         phase = "Completed"
         phase_detail = "Pipeline finished successfully"
         phase_progress = 1.0
@@ -389,7 +666,7 @@ def progress_payload() -> dict[str, object]:
         phase_eta = "Stopped"
         overall_progress = 0.0
     elif orch_pid:
-        stage = "BOOTSTRAPPING"
+        stage = "STARTING"
         phase = "Init"
         phase_detail = "Orchestrator alive; waiting on worker process"
         phase_progress = 0.1
@@ -398,6 +675,24 @@ def progress_payload() -> dict[str, object]:
 
     tiers = tier_counts(ANNOTATED_TSV)
     couple_candidates = candidate_count(CANDIDATE_TSV)
+    has_active_run = bool(bwa_index_pid or full_pid)
+    telemetry = telemetry_payload(
+        [
+            orch_pid,
+            bwa_index_pid,
+            full_pid,
+            bwa_mem_pid,
+            sam_view_pid,
+            sort_name_pid,
+            fixmate_pid,
+            sort_pos_pid,
+            markdup_pid,
+            sam_index_pid,
+            bcftools_pid,
+            snpeff_pid,
+        ],
+        has_active_run=has_active_run,
+    )
 
     return {
         "now": now_txt,
@@ -417,9 +712,23 @@ def progress_payload() -> dict[str, object]:
         "idx_score": idx_score,
         "tiers": tiers,
         "couple_candidates": couple_candidates,
-        "has_active_run": bool(bwa_index_pid or full_pid),
+        "has_active_run": has_active_run,
         "hannah_status": sample_info.get("hannah_status", "unknown"),
+        "telemetry": telemetry,
     }
+
+
+def cached_progress_payload() -> dict[str, object]:
+    now = time.time()
+    with STATUS_CACHE_LOCK:
+        ts = float(STATUS_CACHE.get("ts", 0.0))
+        cached = STATUS_CACHE.get("payload")
+        if cached is not None and (now - ts) < STATUS_CACHE_TTL_SEC:
+            return cached  # type: ignore[return-value]
+        fresh = progress_payload()
+        STATUS_CACHE["ts"] = now
+        STATUS_CACHE["payload"] = fresh
+        return fresh
 
 
 def control_action(action: str) -> dict[str, object]:
@@ -437,14 +746,17 @@ def control_action(action: str) -> dict[str, object]:
         return {
             "ok": False,
             "message": f"unsupported action: {action}",
-            "status": progress_payload(),
+            "status": cached_progress_payload(),
         }
 
     safe_note = "No data deletion: controls do not remove interim files or checkpoints."
+    with STATUS_CACHE_LOCK:
+        STATUS_CACHE["ts"] = 0.0
+        STATUS_CACHE["payload"] = None
     return {
         "ok": ok,
         "message": f"{msg}\n{safe_note}",
-        "status": progress_payload(),
+        "status": cached_progress_payload(),
     }
 
 
@@ -454,7 +766,7 @@ def html_page() -> str:
 <head>
   <meta charset=\"utf-8\" />
   <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
-  <title>Mason Monitor MAX</title>
+  <title>Mason Status Monitor</title>
   <style>
     :root {
       --bg0: #07040f;
@@ -636,10 +948,110 @@ def html_page() -> str:
       padding: 8px;
       white-space: pre-wrap;
     }
+    .load-panel {
+      padding: 14px;
+      background:
+        linear-gradient(145deg, #0d1026dd, #1a0e2bdd),
+        radial-gradient(800px 360px at 10% 0%, #30f2a222, transparent 70%);
+      box-shadow: 0 0 0 2px #ffffff0a inset, 0 20px 40px #02020a88;
+    }
+    .chart-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .load-value {
+      font-size: 40px;
+      line-height: 1;
+      color: #faffff;
+      text-shadow: 0 0 16px #4ad1ffaa, 0 0 34px #ff4fd87a;
+    }
+    .load-value small {
+      font-size: 13px;
+      color: var(--muted);
+      margin-left: 4px;
+    }
+    .load-canvas {
+      width: 100%;
+      height: 270px;
+      border: 2px solid #ffffff26;
+      border-radius: 14px;
+      margin-top: 10px;
+      background:
+        linear-gradient(180deg, #02050b, #02030a),
+        repeating-linear-gradient(90deg, #ffffff08 0 1px, transparent 1px 26px);
+      box-shadow: 0 0 26px #4ad1ff22 inset;
+    }
+    .legend {
+      margin-top: 10px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 12px;
+      font-size: 12px;
+      color: #d9e1ff;
+    }
+    .sw {
+      display: inline-block;
+      width: 20px;
+      height: 3px;
+      margin-right: 6px;
+      border-radius: 99px;
+      vertical-align: middle;
+    }
+    .tele-grid {
+      margin-top: 10px;
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .tele-chip {
+      border: 1px solid #ffffff2e;
+      border-radius: 10px;
+      padding: 8px;
+      background: #ffffff08;
+      position: relative;
+      overflow: hidden;
+    }
+    .chip-line {
+      display: block;
+      width: 100%;
+      height: 4px;
+      border-radius: 999px;
+      margin: -2px 0 8px;
+      background: var(--sw, #ffffff66);
+      filter: drop-shadow(0 0 6px var(--sw, #ffffff66));
+    }
+    .tele-label {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #bdc6e6;
+    }
+    .tele-num {
+      font-size: 20px;
+      margin-top: 5px;
+      line-height: 1;
+      color: #ffffff;
+    }
+    .workers {
+      margin-top: 10px;
+      min-height: 96px;
+      max-height: 170px;
+      font-size: 11px;
+      background: #02040ddc;
+      border-color: #ffffff33;
+    }
     @media (max-width: 980px) {
       .grid { grid-template-columns: 1fr; }
       .strip { grid-template-columns: 1fr 1fr; }
+      .tele-grid { grid-template-columns: 1fr 1fr; }
       .logs { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 640px) {
+      .load-canvas { height: 220px; }
+      .tele-grid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -652,7 +1064,7 @@ def html_page() -> str:
 
     <section class=\"grid\">
       <div class=\"card\">
-        <div class=\"k\">Run Momentum</div>
+        <div class=\"k\">Run Progress</div>
         <div class=\"v\" id=\"eta\">ETA --</div>
         <div class=\"tiny\">Overall progress</div>
         <div class=\"meter\"><div class=\"fill\" id=\"fill\"></div></div>
@@ -687,6 +1099,36 @@ def html_page() -> str:
       </div>
     </section>
 
+    <section class=\"card load-panel\">
+      <div class=\"chart-head\">
+        <div>
+          <div class=\"k\">System Load Timeline</div>
+          <div class=\"tiny\">Pipeline CPU, host CPU, memory pressure, and output write rate (rolling 60-second window).</div>
+        </div>
+        <div class=\"load-value\"><span id=\"loadIndex\">0.00</span><small>/100</small></div>
+      </div>
+      <canvas id=\"loadCanvas\" class=\"load-canvas\"></canvas>
+      <div class=\"legend\">
+        <span><i class=\"sw\" style=\"background:#4ad1ff\"></i>Pipeline CPU</span>
+        <span><i class=\"sw\" style=\"background:#ff4fd8\"></i>Host CPU</span>
+        <span><i class=\"sw\" style=\"background:#ffbf3c\"></i>Memory Pressure</span>
+        <span><i class=\"sw\" style=\"background:#30f2a2\"></i>Output Write Rate (scaled)</span>
+        <span><i class=\"sw\" style=\"background:#ffffff\"></i>Load Index</span>
+      </div>
+      <div class=\"tele-grid\">
+        <div class=\"tele-chip\"><span class=\"chip-line\" style=\"--sw:#ffffff\"></span><div class=\"tele-label\">Scope</div><div class=\"tele-num\" id=\"tscope\">host</div></div>
+        <div class=\"tele-chip\"><span class=\"chip-line\" style=\"--sw:#ffffff\"></span><div class=\"tele-label\">Confidence</div><div class=\"tele-num\" id=\"tconf\">0.00</div></div>
+        <div class=\"tele-chip\"><span class=\"chip-line\" style=\"--sw:#4ad1ff\"></span><div class=\"tele-label\">Pipeline CPU</div><div class=\"tele-num\" id=\"tpcpu\">0.00%</div></div>
+        <div class=\"tele-chip\"><span class=\"chip-line\" style=\"--sw:#4ad1ff\"></span><div class=\"tele-label\">Pipeline Share</div><div class=\"tele-num\" id=\"tshare\">0.00%</div></div>
+        <div class=\"tele-chip\"><span class=\"chip-line\" style=\"--sw:#ff4fd8\"></span><div class=\"tele-label\">Host CPU</div><div class=\"tele-num\" id=\"thcpu\">0.00%</div></div>
+        <div class=\"tele-chip\"><span class=\"chip-line\" style=\"--sw:#ffbf3c\"></span><div class=\"tele-label\">Memory Pressure</div><div class=\"tele-num\" id=\"tmem\">0.00%</div></div>
+        <div class=\"tele-chip\"><span class=\"chip-line\" style=\"--sw:#30f2a2\"></span><div class=\"tele-label\">Output Write Rate</div><div class=\"tele-num\" id=\"tflux\">0.00 MB/s</div></div>
+        <div class=\"tele-chip\"><span class=\"chip-line\" style=\"--sw:#ffffff\"></span><div class=\"tele-label\">Load 1m / Cores</div><div class=\"tele-num\" id=\"tload\">0.00 / 0</div></div>
+      </div>
+      <div class=\"tiny\">Output write rate = estimated MB/s growth across active pipeline BAM/VCF outputs and run logs.</div>
+      <pre id=\"workers\" class=\"workers\">No active pipeline workers detected.</pre>
+    </section>
+
     <section class=\"strip\">
       <div class=\"chip\"><div class=\"k\">Tier A</div><div class=\"num\" id=\"ta\">0</div></div>
       <div class=\"chip\"><div class=\"k\">Tier B</div><div class=\"num\" id=\"tb\">0</div></div>
@@ -715,6 +1157,159 @@ def html_page() -> str:
       return Number.isFinite(n) ? n : 0;
     };
     const fmtPct = (value) => `${asNum(value).toFixed(2)}%`;
+    const fmtNum = (value) => asNum(value).toFixed(2);
+    const chartWindowMs = 60000;
+    let lastTelemetry = null;
+    let tickInFlight = false;
+
+    function lineSeries(points, key, startTs, windowMs, scale = 100) {
+      return points.map((p) => {
+        const raw = asNum(p[key]);
+        const pct = scale > 0 ? (raw / scale) * 100 : raw;
+        const y = Math.max(0, Math.min(100, pct));
+        const x = Math.max(0, Math.min(1, (asNum(p.t) - startTs) / windowMs));
+        return { x, y };
+      });
+    }
+
+    function drawLine(ctx, series, color, glow, w, h, pad, width = 2) {
+      if (!series.length) return;
+      const xAt = (frac) => pad + (frac * (w - (pad * 2)));
+      const yAt = (v) => h - pad - ((v / 100) * (h - (pad * 2)));
+
+      const trace = () => {
+        ctx.beginPath();
+        series.forEach((pt, i) => {
+          const x = xAt(pt.x);
+          const y = yAt(pt.y);
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        });
+      };
+
+      // Broad halo
+      ctx.save();
+      trace();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = width + 5;
+      ctx.globalAlpha = 0.16;
+      ctx.shadowColor = glow;
+      ctx.shadowBlur = 30;
+      ctx.stroke();
+      ctx.restore();
+
+      // Mid halo
+      ctx.save();
+      trace();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = width + 2;
+      ctx.globalAlpha = 0.3;
+      ctx.shadowColor = glow;
+      ctx.shadowBlur = 18;
+      ctx.stroke();
+      ctx.restore();
+
+      // Crisp core
+      ctx.save();
+      trace();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = width;
+      ctx.globalAlpha = 1;
+      ctx.shadowColor = glow;
+      ctx.shadowBlur = 10;
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function drawLoadChart(telemetry) {
+      const canvas = byId("loadCanvas");
+      if (!canvas) return;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      const cw = Math.max(320, canvas.clientWidth || 320);
+      const ch = Math.max(180, canvas.clientHeight || 180);
+      if (canvas.width !== Math.floor(cw * dpr) || canvas.height !== Math.floor(ch * dpr)) {
+        canvas.width = Math.floor(cw * dpr);
+        canvas.height = Math.floor(ch * dpr);
+      }
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+      const w = cw;
+      const h = ch;
+      const pad = 18;
+
+      const bg = ctx.createLinearGradient(0, 0, 0, h);
+      bg.addColorStop(0, "#0b1020");
+      bg.addColorStop(1, "#03040a");
+      ctx.fillStyle = bg;
+      ctx.fillRect(0, 0, w, h);
+
+      ctx.strokeStyle = "rgba(255,255,255,0.08)";
+      ctx.lineWidth = 1;
+      for (let i = 0; i <= 5; i++) {
+        const y = pad + (i * (h - (pad * 2)) / 5);
+        ctx.beginPath();
+        ctx.moveTo(pad, y);
+        ctx.lineTo(w - pad, y);
+        ctx.stroke();
+      }
+
+      const points = Array.isArray(telemetry.history) ? telemetry.history : [];
+      if (!points.length) {
+        ctx.fillStyle = "rgba(216,225,255,0.7)";
+        ctx.font = "12px Menlo, Consolas, monospace";
+        ctx.fillText("Waiting for performance samples...", pad, h / 2);
+        return;
+      }
+
+      const newestTs = asNum(points[points.length - 1].t);
+      const oldestTs = asNum(points[0].t);
+      const startTs = (newestTs - oldestTs) < chartWindowMs ? oldestTs : (newestTs - chartWindowMs);
+      const visible = points.filter((p) => asNum(p.t) >= startTs);
+      if (!visible.length) return;
+
+      const fluxMax = Math.max(10, ...visible.map((p) => asNum(p.flux)));
+      const pipe = lineSeries(visible, "pipe_cpu", startTs, chartWindowMs);
+      const host = lineSeries(visible, "host_cpu", startTs, chartWindowMs);
+      const mem = lineSeries(visible, "mem", startTs, chartWindowMs);
+      const loadIndex = lineSeries(visible, "load_index", startTs, chartWindowMs);
+      const flux = lineSeries(visible, "flux", startTs, chartWindowMs, fluxMax);
+
+      drawLine(ctx, pipe, "#4ad1ff", "#4ad1ffaa", w, h, pad, 2.4);
+      drawLine(ctx, host, "#ff4fd8", "#ff4fd899", w, h, pad, 2.1);
+      drawLine(ctx, mem, "#ffbf3c", "#ffbf3caa", w, h, pad, 2.0);
+      drawLine(ctx, flux, "#30f2a2", "#30f2a299", w, h, pad, 2.0);
+      drawLine(ctx, loadIndex, "#ffffff", "#ffffffaa", w, h, pad, 2.6);
+
+      ctx.fillStyle = "rgba(255,255,255,0.72)";
+      ctx.font = "11px Menlo, Consolas, monospace";
+      ctx.fillText(`Window 60s - output rate scale max ${fmtNum(fluxMax)} MB/s`, pad, 14);
+      ctx.fillText("0%", 4, h - pad + 4);
+      ctx.fillText("100%", 2, pad + 4);
+    }
+
+    function renderTelemetry(telemetry) {
+      const t = telemetry || {};
+      setText("loadIndex", fmtNum(t.load_index));
+      setText("tscope", String(t.scope || "host"));
+      setText("tconf", fmtNum((asNum(t.confidence) * 100)) + "%");
+      setText("tpcpu", fmtPct(t.pipeline_cpu_pct));
+      setText("tshare", fmtPct(t.pipeline_share_pct));
+      setText("thcpu", fmtPct(t.host_cpu_pct));
+      setText("tmem", fmtPct(t.memory_pressure_pct));
+      setText("tflux", `${fmtNum(t.data_flux_mbps)} MB/s`);
+      setText("tload", `${fmtNum(t.load_1m)} / ${asNum(t.logical_cpu).toFixed(0)}`);
+
+      const workers = Array.isArray(t.top_workers) ? t.top_workers : [];
+      byId("workers").textContent = workers.length
+        ? workers.map((w, i) => `${i + 1}. pid ${w.pid} | ${fmtPct(w.cpu_pct)} | ${w.cmd}`).join("\\n")
+        : "No active pipeline workers detected.";
+
+      drawLoadChart(t);
+      lastTelemetry = t;
+    }
 
     function render(data) {
       setText("stage", data.stage || "Unknown");
@@ -750,6 +1345,7 @@ def html_page() -> str:
 
       byId("orchlog").textContent = data.orchestrator_log || "";
       byId("fulllog").textContent = data.full_log || "";
+      renderTelemetry(data.telemetry || {});
     }
 
     function setControlsEnabled(enabled) {
@@ -789,13 +1385,15 @@ def html_page() -> str:
     }
 
     async function tick() {
+      if (tickInFlight) return;
+      tickInFlight = true;
       try {
         const res = await fetch('/api/status', { cache: 'no-store' });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         render(await res.json());
       } catch (err) {
         render({
-          stage: "IDLE VOID",
+          stage: "IDLE",
           detail: `status fetch failed: ${err.message}`,
           eta: "Unknown",
           progress: 0,
@@ -812,13 +1410,33 @@ def html_page() -> str:
           tiers: { tier_a: 0, tier_b: 0, tier_c: 0 },
           couple_candidates: 0,
           orchestrator_log: "",
-          full_log: ""
+          full_log: "",
+          telemetry: {
+            logical_cpu: 0,
+            scope: "host",
+            confidence: 0,
+            host_cpu_pct: 0,
+            pipeline_cpu_pct: 0,
+            pipeline_mem_pct: 0,
+            pipeline_share_pct: 0,
+            memory_pressure_pct: 0,
+            load_1m: 0,
+            data_flux_mbps: 0,
+            load_index: 0,
+            top_workers: [],
+            history: []
+          }
         });
+      } finally {
+        tickInFlight = false;
       }
     }
 
     tick();
-    setInterval(tick, 5000);
+    setInterval(tick, 500);
+    window.addEventListener("resize", () => {
+      if (lastTelemetry) drawLoadChart(lastTelemetry);
+    });
   </script>
 </body>
 </html>
@@ -838,7 +1456,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, html_page().encode("utf-8"), "text/html; charset=utf-8")
             return
         if self.path == "/api/status":
-            self._send(200, json.dumps(progress_payload()).encode("utf-8"), "application/json; charset=utf-8")
+            self._send(200, json.dumps(cached_progress_payload()).encode("utf-8"), "application/json; charset=utf-8")
             return
         self._send(404, b"not found", "text/plain; charset=utf-8")
 
@@ -869,7 +1487,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         if self.path == "/api/status":
-            body = json.dumps(progress_payload()).encode("utf-8")
+            body = json.dumps(cached_progress_payload()).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -889,8 +1507,8 @@ def main() -> None:
             PORT = int(sys.argv[1])
         except ValueError:
             pass
-    server = HTTPServer(("127.0.0.1", PORT), Handler)
-    print(f"Maximalist monitor on http://127.0.0.1:{PORT}/")
+    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    print(f"Status monitor on http://127.0.0.1:{PORT}/")
     server.serve_forever()
 
 
